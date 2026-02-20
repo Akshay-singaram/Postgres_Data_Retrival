@@ -1,12 +1,17 @@
 """
 WinCC OA Historian Data Export — main entry point.
 
-Edit the configuration section below, then run:
-    python main.py
+Can be run directly (CLI mode) or imported by gui.py which calls
+run_pipeline() with a progress callback.
+
+    python main.py          # CLI
+    python gui.py           # GUI with progress bar
 """
 
 import time
 from datetime import datetime
+
+import pandas as pd
 
 from db_config import get_connection
 from segment_lookup import get_segments_for_range, _datetime_to_ns
@@ -30,44 +35,62 @@ def _parse(dt_str: str) -> datetime:
     return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
 
 
-def main():
+def run_pipeline(
+    start_dt: datetime,
+    end_dt: datetime,
+    sample_rate: str,
+    output_dir: str,
+    on_progress=None,
+) -> str:
+    """Execute the full export pipeline.
+
+    Parameters
+    ----------
+    start_dt, end_dt : datetime boundaries for the export.
+    sample_rate : pandas frequency string ('1s', '5s', '1min', …).
+    output_dir : directory where the CSV will be written.
+    on_progress : optional callback(percent: int, message: str)
+        called at each stage so a GUI can update a progress bar.
+
+    Returns
+    -------
+    The file path of the exported CSV, or an error message string
+    prefixed with "ERROR: ".
+    """
+    def _progress(pct: int, msg: str):
+        print(f"[{pct:3d}%] {msg}")
+        if on_progress:
+            on_progress(pct, msg)
+
     t_total = time.time()
-
-    start_dt = _parse(START_TIME)
-    end_dt = _parse(END_TIME)
     start_ns = _datetime_to_ns(start_dt)
+    end_ns = _datetime_to_ns(end_dt)
 
-    print(f"=== WinCC OA Data Export ===")
-    print(f"    Range : {start_dt}  ->  {end_dt}")
-    print(f"    Rate  : {SAMPLE_RATE}")
-    print()
+    _progress(0, "Connecting to database…")
 
     # ---- 1. Connect --------------------------------------------------
-    t0 = time.time()
-    conn = get_connection()
-    print(f"[main] Connected to database  ({time.time() - t0:.2f}s)")
+    try:
+        conn = get_connection()
+    except Exception as e:
+        return f"ERROR: Database connection failed — {e}"
 
     try:
         # ---- 2. Segment lookup ---------------------------------------
-        t0 = time.time()
+        _progress(5, "Looking up segments…")
         segments = get_segments_for_range(conn, start_dt, end_dt)
-        print(f"[main] Segment lookup  ({time.time() - t0:.2f}s)")
 
         if not segments:
-            print("[main] No segments found for the requested range. Exiting.")
-            return
+            return "ERROR: No segments found for the requested time range."
 
         segment_ids = [s["segment_id"] for s in segments]
+        num_segments = len(segments)
 
         # ---- 3. Element discovery ------------------------------------
-        t0 = time.time()
+        _progress(10, f"Discovering elements across {num_segments} segment(s)…")
         elements_df = get_elements_in_segments(conn, segment_ids)
-        print(f"[main] Discovered {len(elements_df)} elements  "
-              f"({time.time() - t0:.2f}s)")
 
         if elements_df.empty:
-            print("[main] No elements found in the matched segments. Exiting.")
-            return
+            return "ERROR: No elements found in matched segments."
 
         element_map = dict(
             zip(elements_df["element_id"], elements_df["element_name"])
@@ -75,83 +98,86 @@ def main():
         element_ids = list(element_map.keys())
 
         # ---- 4. Last-known values (look-back) ------------------------
-        t0 = time.time()
-        # For the look-back we also include segments that end before our window
+        _progress(15, f"Looking back for initial values ({len(element_ids)} elements)…")
         lookback_segments = get_segments_for_range(
-            conn,
-            datetime(1970, 1, 1),
-            end_dt,
+            conn, datetime(1970, 1, 1), end_dt,
         )
         lookback_ids = [s["segment_id"] for s in lookback_segments]
 
         last_values_by_id = get_last_known_values(
             conn, lookback_ids, start_ns, element_ids
         )
-        # Convert keys from element_id to element_name for resample_and_fill
         initial_values = {
             element_map[eid]: val
             for eid, val in last_values_by_id.items()
             if eid in element_map
         }
-        print(f"[main] Look-back complete  ({time.time() - t0:.2f}s)")
 
-        # ---- 5 & 6. Extract raw data from each segment & combine -----
-        t0 = time.time()
-        import pandas as pd
-
+        # ---- 5 & 6. Extract raw data per segment --------------------
+        # Progress 20% → 75% is split across segments
         raw_frames = []
-        for seg in segments:
+        for idx, seg in enumerate(segments):
+            pct = 20 + int((idx / num_segments) * 55)
             sid = seg["segment_id"]
+            _progress(pct, f"Extracting segment {idx + 1}/{num_segments} "
+                           f"(id {sid})…")
+
             seg_start = max(seg["start_time"], start_ns)
-            seg_end = min(seg["end_time"], _datetime_to_ns(end_dt))
+            seg_end = min(seg["end_time"], end_ns)
             df_seg = extract_segment_data(conn, sid, seg_start, seg_end)
             if not df_seg.empty:
                 raw_frames.append(df_seg)
-            print(f"       segment {sid}: {len(df_seg)} rows")
 
         if raw_frames:
             raw_df = pd.concat(raw_frames, ignore_index=True)
         else:
             raw_df = pd.DataFrame(columns=["timestamp", "element_id", "value"])
-
         del raw_frames
-        print(f"[main] Extracted {len(raw_df)} total raw rows  "
-              f"({time.time() - t0:.2f}s)")
+
+        total_raw = len(raw_df)
+        _progress(75, f"Extracted {total_raw} raw rows. Pivoting…")
 
         # ---- 7. Pivot ------------------------------------------------
-        t0 = time.time()
         pivoted = pivot_data(raw_df, element_map)
         del raw_df
-        print(f"[main] Pivoted shape: {pivoted.shape}  "
-              f"({time.time() - t0:.2f}s)")
 
         # ---- 8. Resample & forward-fill ------------------------------
-        t0 = time.time()
+        _progress(85, f"Resampling at {sample_rate} and forward-filling…")
         result = resample_and_fill(
-            pivoted, start_dt, end_dt, SAMPLE_RATE, initial_values
+            pivoted, start_dt, end_dt, sample_rate, initial_values
         )
         del pivoted
-        print(f"[main] Resampled shape: {result.shape}  "
-              f"({time.time() - t0:.2f}s)")
-
-        nan_count = result.isna().sum().sum()
-        print(f"[main] NaN values remaining after forward-fill: {nan_count}")
 
         # ---- 9. Export -----------------------------------------------
-        t0 = time.time()
-        out_path = export_to_csv(result, OUTPUT_DIR, start_dt, end_dt)
-        print(f"[main] CSV export  ({time.time() - t0:.2f}s)")
+        _progress(92, f"Exporting CSV ({len(result)} rows × "
+                       f"{len(result.columns)} cols)…")
+        out_path = export_to_csv(result, output_dir, start_dt, end_dt)
 
-        # ---- 10. Summary ---------------------------------------------
-        print()
-        print(f"=== Done in {time.time() - t_total:.2f}s ===")
-        print(f"    Output : {out_path}")
-        print(f"    Rows   : {len(result)}")
-        print(f"    Columns: {len(result.columns)}")
+        elapsed = time.time() - t_total
+        _progress(100, f"Done in {elapsed:.1f}s — {out_path}")
+        return out_path
 
     finally:
         conn.close()
         print("[main] Database connection closed.")
+
+
+# --------------------- CLI entry point --------------------------------
+def main():
+    start_dt = _parse(START_TIME)
+    end_dt = _parse(END_TIME)
+
+    print(f"=== WinCC OA Data Export ===")
+    print(f"    Range : {start_dt}  ->  {end_dt}")
+    print(f"    Rate  : {SAMPLE_RATE}")
+    print()
+
+    result = run_pipeline(start_dt, end_dt, SAMPLE_RATE, OUTPUT_DIR)
+
+    if result.startswith("ERROR:"):
+        print(result)
+    else:
+        print(f"\nExported to: {result}")
 
 
 if __name__ == "__main__":
