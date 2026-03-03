@@ -1,7 +1,7 @@
 """
 Raw data extraction from WinCC OA event tables.
 
-Event tables are named  "._event_{segment_id}_a"  (note the leading dot).
+Event tables are named  "_event_{segment_id}_a".
 Table names cannot be parameterised in SQL, so we use psycopg2.sql to
 build them safely.  segment_id always comes from our own segments query
 (never from user input), but we still validate it as an integer.
@@ -19,8 +19,8 @@ def _datetime_to_ns(dt: datetime) -> int:
 
 
 def _event_table_name(segment_id: int) -> str:
-    """Return the literal table name including the leading dot."""
-    return f"._event_{int(segment_id)}_a"
+    """Return the literal table name."""
+    return f"_event_{int(segment_id)}_a"
 
 
 # --------------------------------------------------- element discovery
