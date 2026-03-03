@@ -26,8 +26,11 @@ def _event_table_name(segment_id: int) -> str:
 # --------------------------------------------------- element discovery
 def get_all_elements(conn) -> pd.DataFrame:
     """Return every element (element_id, element_name, type_)."""
-    query = "SELECT element_id, element_name, type_ FROM elements;"
-    return pd.read_sql(query, conn)
+    with conn.cursor() as cur:
+        cur.execute("SELECT element_id, element_name, type_ FROM elements;")
+        rows = cur.fetchall()
+        cols = [desc[0] for desc in cur.description]
+    return pd.DataFrame(rows, columns=cols)
 
 
 def get_elements_in_segments(conn, segment_ids: list) -> pd.DataFrame:
@@ -60,7 +63,11 @@ def get_elements_in_segments(conn, segment_ids: list) -> pd.DataFrame:
         f"SELECT element_id, element_name, type_ "
         f"FROM elements WHERE element_id IN ({placeholders})"
     )
-    return pd.read_sql(query, conn, params=list(all_element_ids))
+    with conn.cursor() as cur:
+        cur.execute(query, list(all_element_ids))
+        rows = cur.fetchall()
+        cols = [desc[0] for desc in cur.description]
+    return pd.DataFrame(rows, columns=cols)
 
 
 # ------------------------------------------------- raw data extraction
