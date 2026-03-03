@@ -9,7 +9,7 @@ run_pipeline() with a progress callback.
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -100,7 +100,7 @@ def run_pipeline(
         # ---- 4. Last-known values (look-back) ------------------------
         _progress(15, f"Looking back for initial values ({len(element_ids)} elements)…")
         lookback_segments = get_segments_for_range(
-            conn, datetime(1970, 1, 1), end_dt,
+            conn, datetime(1970, 1, 1, tzinfo=timezone.utc), end_dt,
         )
         lookback_ids = [s["segment_id"] for s in lookback_segments]
 
